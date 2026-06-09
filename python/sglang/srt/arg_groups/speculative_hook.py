@@ -125,6 +125,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
+    if (
+        server_args.enable_linear_compact_spec_cache
+        and server_args.speculative_eagle_topk is not None
+        and server_args.speculative_eagle_topk != 1
+    ):
+        raise ValueError(
+            "--enable-linear-compact-spec-cache currently only supports "
+            "speculative_eagle_topk == 1."
+        )
+
     if server_args.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
         if server_args.speculative_adaptive:

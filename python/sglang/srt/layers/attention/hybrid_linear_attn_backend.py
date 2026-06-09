@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
@@ -1027,15 +1027,24 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
-        intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if isinstance(mamba_caches, MambaPool.LinearCompactSpeculativeState):
+            self.linear_attn_backend.update_linear_compact_spec_cache_after_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        else:
+            intermediate_state_cache = mamba_caches.intermediate_ssm
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
         # conv intermediate uses the deduplicated sliding-window layout, so it
         # needs the strided-read scatter variant.
         fused_conv_window_scatter_with_mask(
@@ -1048,12 +1057,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Track indices for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            fused_mamba_state_scatter_with_mask(
-                ssm_states,
-                intermediate_state_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            if not isinstance(
+                mamba_caches, MambaPool.LinearCompactSpeculativeState
+            ):
+                fused_mamba_state_scatter_with_mask(
+                    ssm_states,
+                    intermediate_state_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
             fused_conv_window_scatter_with_mask(
                 conv_states,
                 intermediate_conv_window_cache,

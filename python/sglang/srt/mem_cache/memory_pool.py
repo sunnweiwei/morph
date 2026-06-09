@@ -351,6 +351,15 @@ class MambaPool:
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
 
+    @dataclass(frozen=True, kw_only=True)
+    class LinearCompactSpeculativeState(State):
+        intermediate_conv_window: List[torch.Tensor]
+        intermediate_k: torch.Tensor
+        intermediate_v: torch.Tensor
+        intermediate_decay: torch.Tensor
+
+    SpeculativeStateTypes = (SpeculativeState, LinearCompactSpeculativeState)
+
     def __init__(
         self,
         *,
@@ -362,6 +371,7 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_linear_compact_spec_cache: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
@@ -494,20 +504,22 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
+                intermediate_ssm_state_cache = None
+                if not enable_linear_compact_spec_cache:
+                    # Full control path: materialize one complete recurrent state
+                    # per verification token.
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
@@ -588,25 +600,70 @@ class MambaPool:
                         for conv_shape in conv_state_shape
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
-                self.mamba_cache = self.SpeculativeState(
-                    conv=conv_state,
-                    temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    replayssm_d=replayssm_d,
-                    replayssm_k=replayssm_k,
-                    replayssm_g=replayssm_g,
-                )
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    # Report the deduplicated PHYSICAL conv-window buffers (the view
-                    # over-reports its logical, un-deduplicated size).
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
-                )
+                if enable_linear_compact_spec_cache:
+                    hv, value_dim, key_dim = temporal_state_shape
+                    intermediate_k_cache = torch.zeros(
+                        (
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            hv,
+                            key_dim,
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    intermediate_v_cache = torch.zeros(
+                        (
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            hv,
+                            value_dim,
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    intermediate_decay_cache = torch.zeros_like(intermediate_k_cache)
+                    self.mamba_cache = self.LinearCompactSpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_k=intermediate_k_cache,
+                        intermediate_v=intermediate_v_cache,
+                        intermediate_decay=intermediate_decay_cache,
+                        replayssm_d=replayssm_d,
+                        replayssm_k=replayssm_k,
+                        replayssm_g=replayssm_g,
+                    )
+                    logger.info(
+                        "Mamba Cache is allocated with compact speculative replay. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB, "
+                        f"compact_k size: {get_tensor_size_bytes(intermediate_k_cache) / GB:.2f}GB, "
+                        f"compact_v size: {get_tensor_size_bytes(intermediate_v_cache) / GB:.2f}GB, "
+                        f"compact_decay size: {get_tensor_size_bytes(intermediate_decay_cache) / GB:.2f}GB, "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB"
+                    )
+                else:
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=intermediate_ssm_state_cache,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        replayssm_d=replayssm_d,
+                        replayssm_k=replayssm_k,
+                        replayssm_g=replayssm_g,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                    )
             else:
                 self.mamba_cache = self.State(
                     conv=conv_state,
@@ -644,7 +701,7 @@ class MambaPool:
                 else None
             )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
-            if isinstance(self.mamba_cache, self.SpeculativeState):
+            if isinstance(self.mamba_cache, self.SpeculativeStateTypes):
                 # `intermediate_conv_window` is an as_strided view whose logical
                 # shape over-reports its real footprint; charge the physical buffers
                 # instead. No-op for the dense layout, where the view and the
@@ -658,8 +715,10 @@ class MambaPool:
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
-    def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
-        assert isinstance(self.mamba_cache, self.SpeculativeState)
+    def get_speculative_mamba2_params_all_layers(
+        self,
+    ) -> SpeculativeState | LinearCompactSpeculativeState:
+        assert isinstance(self.mamba_cache, self.SpeculativeStateTypes)
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
@@ -748,7 +807,7 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field.startswith("intermediate_"):
                 continue
             # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
             # scratch, not part of the persistent transferable state.
@@ -787,9 +846,7 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Mirror the exclusions in get_contiguous_buf_infos so the returned
             # dims line up element-wise with the RDMA buffer list.
-            if field in (
-                "intermediate_ssm",
-                "intermediate_conv_window",
+            if field.startswith("intermediate_") or field in (
                 "replayssm_d",
                 "replayssm_k",
                 "replayssm_g",
@@ -831,6 +888,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_linear_compact_spec_cache: bool = False,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
@@ -859,6 +917,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
@@ -874,6 +933,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        enable_linear_compact_spec_cache: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
@@ -887,6 +947,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_linear_compact_spec_cache=enable_linear_compact_spec_cache,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
@@ -991,7 +1052,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
-    def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
+    def get_speculative_mamba2_params_all_layers(
+        self,
+    ) -> MambaPool.SpeculativeState | MambaPool.LinearCompactSpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
     def get_state_buf_infos(self):

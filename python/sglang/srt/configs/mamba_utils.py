@@ -125,6 +125,21 @@ class BaseLinearStateParams(ABC):
         ) * len(self.layers)
 
     @property
+    def compact_intermediate_cache_per_req(self) -> int:
+        conv_numel = int(
+            np.sum([np.prod(conv_shape) for conv_shape in self.shape.conv])
+        )
+
+        # The generic compact replay layout stores normalized K, post-beta
+        # delta V, and decay instead of a full [H, V, K] state per verify token.
+        num_heads, value_dim, key_dim = self.shape.temporal
+        temporal_numel = num_heads * (key_dim + value_dim + key_dim)
+        return (
+            conv_numel * self.dtype.conv.itemsize
+            + temporal_numel * self.dtype.temporal.itemsize
+        ) * len(self.layers)
+
+    @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
         the ReplaySSM ring ``g_cache`` layout ([.., L] scalar vs [.., L, K]
