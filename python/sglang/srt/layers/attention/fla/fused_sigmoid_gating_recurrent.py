@@ -5,6 +5,30 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _mul_rn_f32(a, b):
+    return tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fma_rn_f32(a, b, c):
+    return tl.inline_asm_elementwise(
+        asm="fma.rn.f32 $0, $1, $2, $3;",
+        constraints="=f,f,f,f",
+        args=[a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -195,9 +219,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply gating to hidden state: h *= exp(g)
         b_decay = tl.exp(b_g)
         if IS_KDA:
-            b_h *= b_decay[:, None]
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
         else:
-            b_h *= b_decay
+            b_h = _mul_rn_f32(b_h, b_decay)
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -244,7 +268,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
 
         # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+        b_h = _fma_rn_f32(b_k[:, None], b_v[None, :], b_h)
 
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)

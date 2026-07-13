@@ -2,6 +2,31 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _mul_rn_f32(a, b):
+    return tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fma_rn_f32(a, b, c):
+    return tl.inline_asm_elementwise(
+        asm="fma.rn.f32 $0, $1, $2, $3;",
+        constraints="=f,f,f,f",
+        args=[a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 @triton.jit
 def _fused_linear_compact_state_replay_with_mask_kernel(
     dst_ptr,
@@ -78,8 +103,8 @@ def _fused_linear_compact_state_replay_with_mask_kernel(
                 tl.float32
             )
 
-            b_h *= b_decay[:, None]
-            b_h += b_k_norm[:, None] * b_delta_v[None, :]
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
+            b_h = _fma_rn_f32(b_k_norm[:, None], b_delta_v[None, :], b_h)
 
     dst_out = (
         ((pid_layer * dst_req_size + dst_idx) * NUM_HEADS + pid_head) * V * K
@@ -177,8 +202,8 @@ def _fused_linear_compact_state_replay_with_track_kernel(
                 tl.float32
             )
 
-            b_h *= b_decay[:, None]
-            b_h += b_k_norm[:, None] * b_delta_v[None, :]
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
+            b_h = _fma_rn_f32(b_k_norm[:, None], b_delta_v[None, :], b_h)
 
         track_out = (
             ((pid_layer * dst_req_size + track_dst_idx) * NUM_HEADS + pid_head) * V * K
@@ -212,8 +237,8 @@ def _fused_linear_compact_state_replay_with_track_kernel(
                 tl.float32
             )
 
-            b_h *= b_decay[:, None]
-            b_h += b_k_norm[:, None] * b_delta_v[None, :]
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
+            b_h = _fma_rn_f32(b_k_norm[:, None], b_delta_v[None, :], b_h)
     else:
         for t in tl.range(0, accepted_step + 1):
             k_norm_base = (
@@ -235,8 +260,8 @@ def _fused_linear_compact_state_replay_with_track_kernel(
                 tl.float32
             )
 
-            b_h *= b_decay[:, None]
-            b_h += b_k_norm[:, None] * b_delta_v[None, :]
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
+            b_h = _fma_rn_f32(b_k_norm[:, None], b_delta_v[None, :], b_h)
 
     accepted_out = (
         ((pid_layer * dst_req_size + accepted_dst_idx) * NUM_HEADS + pid_head) * V * K
@@ -304,9 +329,12 @@ def fused_linear_compact_state_replay_with_mask(
     V = dst.shape[3]
     K = dst.shape[4]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 128)
+    # Match the target-verify recurrence tile exactly. Besides making the
+    # comparison controlled, this avoids changing FP32 instruction scheduling
+    # merely because the accepted state is reconstructed in another kernel.
+    BV = min(triton.next_power_of_2(V), 32)
     NV = triton.cdiv(V, BV)
-    num_warps = 4
+    num_warps = 1
     grid = (total_requests, num_layers, num_heads * NV)
 
     _fused_linear_compact_state_replay_with_mask_kernel[grid](
@@ -380,9 +408,9 @@ def fused_linear_compact_state_replay_with_optional_track(
     V = dst.shape[3]
     K = dst.shape[4]
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 128)
+    BV = min(triton.next_power_of_2(V), 32)
     NV = triton.cdiv(V, BV)
-    num_warps = 4
+    num_warps = 1
     grid = (total_requests, num_layers, num_heads * NV)
 
     _fused_linear_compact_state_replay_with_track_kernel[grid](
@@ -408,4 +436,3 @@ def fused_linear_compact_state_replay_with_optional_track(
         num_warps=num_warps,
         num_stages=3,
     )
-
