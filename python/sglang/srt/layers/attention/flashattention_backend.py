@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -342,11 +343,12 @@ class FlashAttentionBackend(AttentionBackend):
         # We set nums splits to 1 if deterministic inference is enabled.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
+        forced_num_splits = int(os.environ.get("SGLANG_FORCE_FA3_NUM_SPLITS", "0"))
         self.num_splits = (
             1
             if model_runner.server_args.enable_deterministic_inference
             or (self.fa_impl_ver == 4 and not cuda_graph_fully_disabled())
-            else 0
+            else (forced_num_splits if forced_num_splits > 0 else 0)
         )
 
         # In embedding mode with no chunked prefill and radix cache disabled,

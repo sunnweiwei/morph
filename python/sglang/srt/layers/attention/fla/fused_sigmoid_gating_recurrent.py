@@ -170,8 +170,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         )
         b_g = -tl.exp(b_A_log) * softplus_x
 
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        # Match the packed single-token decode kernel exactly.  That path
+        # rounds sigmoid(beta) to the model dtype before converting it back to
+        # fp32 for the recurrent update.  Keeping beta in fp32 here makes
+        # TARGET_VERIFY advance a numerically different GDN state, which can
+        # eventually change greedy token selection even for a linear (top-k=1)
+        # speculative chain.
+        if IS_KDA:
+            b_beta = tl.sigmoid(b_b).to(tl.float32)
+        else:
+            b_beta = tl.sigmoid(b_b).to(p_b.dtype.element_ty).to(tl.float32)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:

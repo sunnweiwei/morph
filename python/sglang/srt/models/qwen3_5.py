@@ -15,16 +15,64 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 import triton
+import triton.language as tl
 
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
+
+
+@triton.jit
+def _gdn_ba_matmul_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs_n = tl.program_id(1) + tl.arange(0, 1)
+    offs_k = tl.arange(0, BLOCK_K)
+    accumulator = tl.zeros((1,), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        k = k_start + offs_k
+        x = tl.load(
+            x_ptr + row * K + k,
+            mask=k < K,
+            other=0.0,
+        ).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + offs_n[:, None] * K + k[None, :],
+            mask=(offs_n[:, None] < N) & (k[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += tl.sum(weight * x[None, :], axis=1)
+    tl.store(out_ptr + row * N + offs_n, accumulator, mask=offs_n < N)
+
+
+def _gdn_ba_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    m, k = x.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    _gdn_ba_matmul_kernel[(m, n)](
+        x,
+        weight,
+        out,
+        N=n,
+        K=k,
+        BLOCK_K=1024,
+        num_warps=1,
+        num_stages=2,
+    )
+    return out
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -469,7 +517,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self, hidden_states: torch.Tensor, use_batch_invariant_ba: bool
+    ):
         if (
             _is_cpu
             or _is_npu
@@ -490,12 +540,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = self._forward_ba_proj(
+                    hidden_states, use_batch_invariant_ba
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._forward_ba_proj(
+                hidden_states, use_batch_invariant_ba
+            )
         return projected_states_qkvz, projected_states_ba
+
+    def _forward_ba_proj(
+        self, hidden_states: torch.Tensor, use_batch_invariant_ba: bool
+    ) -> torch.Tensor:
+        if (
+            use_batch_invariant_ba
+            and os.environ.get("SGLANG_QWEN35_BATCH_INVARIANT_BA", "1") != "0"
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and self.in_proj_ba.bias is None
+        ):
+            return _gdn_ba_matmul(hidden_states, self.in_proj_ba.weight)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_ba
 
     def forward(
         self,
@@ -509,7 +578,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states,
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify(),
         )
 
         if (
