@@ -620,6 +620,8 @@ def eagle_sample(
     if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if verify_input.online_mtp_ticket_id is not None:
+            verify_input.online_mtp_teacher_tokens = target_predict
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

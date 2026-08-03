@@ -5,6 +5,30 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _mul_rn_f32(a, b):
+    return tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _fma_rn_f32(a, b, c):
+    return tl.inline_asm_elementwise(
+        asm="fma.rn.f32 $0, $1, $2, $3;",
+        constraints="=f,f,f,f",
+        args=[a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -22,6 +46,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
+    compact_k_buffer,
+    compact_v_buffer,
+    compact_decay_buffer,
     intermediate_state_indices,
     cache_steps,
     retrieve_parent_token_ptr,
@@ -50,6 +77,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    CACHE_COMPACT_REPLAY_INPUTS: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
 ):
     """
@@ -120,7 +148,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
-    if CACHE_INTERMEDIATE_STATES:
+    if CACHE_INTERMEDIATE_STATES or CACHE_COMPACT_REPLAY_INPUTS:
         cache_idx = tl.load(intermediate_state_indices + i_n)
 
     step_idx = 0
@@ -170,8 +198,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         )
         b_g = -tl.exp(b_A_log) * softplus_x
 
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        # Match the packed single-token decode kernel exactly.  That path
+        # rounds sigmoid(beta) to the model dtype before converting it back to
+        # fp32 for the recurrent update.  Keeping beta in fp32 here makes
+        # TARGET_VERIFY advance a numerically different GDN state, which can
+        # eventually change greedy token selection even for a linear (top-k=1)
+        # speculative chain.
+        if IS_KDA:
+            b_beta = tl.sigmoid(b_b).to(tl.float32)
+        else:
+            b_beta = tl.sigmoid(b_b).to(p_b.dtype.element_ty).to(tl.float32)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -181,10 +217,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = b_q * scale
 
         # Apply gating to hidden state: h *= exp(g)
+        b_decay = tl.exp(b_g)
         if IS_KDA:
-            b_h *= tl.exp(b_g[:, None])
+            b_h = _mul_rn_f32(b_h, b_decay[:, None])
         else:
-            b_h *= tl.exp(b_g)
+            b_h = _mul_rn_f32(b_h, b_decay)
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -192,8 +229,46 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Apply beta gating: v *= beta
         b_v *= b_beta
 
+        # Cache compact per-token replay inputs.
+        #
+        # KDA stores normalized K in the generic K buffer and the exact
+        # post-beta delta V used by the state update in the generic V buffer:
+        #   h_next = decay * h_prev + k_norm * delta_v
+        # K and decay are independent of the V tile, so only the first V tile
+        # writes them.
+        if CACHE_COMPACT_REPLAY_INPUTS:
+            if cache_idx >= 0:
+                compact_step_k_offset = (
+                    cache_idx * cache_steps * HV * K
+                    + step_idx * HV * K
+                    + i_hv * K
+                    + o_k
+                )
+                compact_step_v_offset = (
+                    cache_idx * cache_steps * HV * V
+                    + step_idx * HV * V
+                    + i_hv * V
+                    + o_v
+                )
+                if i_v == 0:
+                    tl.store(
+                        compact_k_buffer + compact_step_k_offset,
+                        b_k.to(compact_k_buffer.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                    tl.store(
+                        compact_decay_buffer + compact_step_k_offset,
+                        b_decay.to(compact_decay_buffer.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                tl.store(
+                    compact_v_buffer + compact_step_v_offset,
+                    b_v.to(compact_v_buffer.dtype.element_ty),
+                    mask=mask_v,
+                )
+
         # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+        b_h = _fma_rn_f32(b_k[:, None], b_v[None, :], b_h)
 
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -257,6 +332,9 @@ def fused_sigmoid_gating_delta_rule_update(
     # Optional parameters for target_verify support
     disable_state_update: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
+    compact_k_buffer: Optional[torch.Tensor] = None,
+    compact_v_buffer: Optional[torch.Tensor] = None,
+    compact_decay_buffer: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[
         int
@@ -297,6 +375,10 @@ def fused_sigmoid_gating_delta_rule_update(
 
     o = q.new_empty(NK, *v.shape)
 
+    has_compact_replay_cache = compact_k_buffer is not None
+    # When present, compact replay buffers are allocated by MambaPool, so their
+    # shapes and contiguous layout are guaranteed by pool initialization.
+
     # Prepare retrieve_parent_token strides
     if retrieve_parent_token is not None:
         stride_retrieve_parent_token_seq = retrieve_parent_token.stride(0)
@@ -311,11 +393,12 @@ def fused_sigmoid_gating_delta_rule_update(
 
     # Per-req stride must match the buffer's allocated dim, not runtime steps
     # (they can differ under --speculative-adaptive).
-    cache_stride_steps = (
-        intermediate_states_buffer.shape[1]
-        if intermediate_states_buffer is not None
-        else 0
-    )
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.shape[1]
+    elif has_compact_replay_cache:
+        cache_stride_steps = compact_k_buffer.shape[1]
+    else:
+        cache_stride_steps = 0
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -332,6 +415,9 @@ def fused_sigmoid_gating_delta_rule_update(
         h0_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
+        compact_k_buffer=compact_k_buffer,
+        compact_v_buffer=compact_v_buffer,
+        compact_decay_buffer=compact_decay_buffer,
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
@@ -358,6 +444,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        CACHE_COMPACT_REPLAY_INPUTS=has_compact_replay_cache,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,

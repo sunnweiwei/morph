@@ -1967,6 +1967,10 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    enable_linear_compact_spec_cache: A[
+        bool,
+        "Enable compact K/V/decay replay storage during speculative target verification.",
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
@@ -4672,6 +4676,16 @@ class ServerArgs:
                 "SM100+ detected with mamba-ssm-dtype=bfloat16, "
                 "defaulting --linear-attn-decode-backend to flashinfer."
             )
+
+        if self.enable_linear_compact_spec_cache:
+            decode = self.linear_attn_decode_backend or self.linear_attn_backend
+            if decode != "triton":
+                logger.info(
+                    "--enable-linear-compact-spec-cache requires Triton target "
+                    "verify; setting --linear-attn-decode-backend from %s to triton.",
+                    decode,
+                )
+            self.linear_attn_decode_backend = "triton"
 
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend

@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, SERVER_WARMUP_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -201,6 +202,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.online_mtp_runtime = None
 
     def alloc_memory_pool(
         self,
@@ -218,6 +220,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self._init_online_mtp_runtime()
 
         if self.server_args.speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -234,6 +237,127 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     f"target to share one vocab, but the draft vocab "
                     f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
                 )
+
+    def _init_online_mtp_runtime(self) -> None:
+        if not envs.SGLANG_EXPERIMENTAL_ONLINE_MTP.get():
+            return
+        if self.online_mtp_runtime is not None:
+            return
+        if self.topk != 1:
+            raise ValueError("online MTP training currently requires topk=1")
+        if self.server_args.speculative_use_rejection_sampling:
+            raise ValueError(
+                "online MTP training currently requires greedy verification, "
+                "not rejection sampling"
+            )
+        if self.speculative_num_steps <= 1:
+            raise ValueError("online MTP training requires at least two draft steps")
+        if envs.SGLANG_ONLINE_MTP_FUSE_CE_ARGMAX.get() and self.topk != 1:
+            raise ValueError("online MTP fused CE argmax requires speculative topk=1")
+
+        draft_model = self.draft_runner.model
+        if draft_model.__class__.__name__ != "Qwen3_5ForCausalLMMTP":
+            raise ValueError(
+                "online MTP training currently supports only native Qwen3.5/3.6 "
+                f"MTP, got {draft_model.__class__.__name__}"
+            )
+
+        from sglang.srt.speculative.online_mtp_training import OnlineMTPRuntime
+
+        self.online_mtp_runtime = OnlineMTPRuntime(
+            draft_model,
+            activation_bytes=envs.SGLANG_ONLINE_MTP_ACTIVATION_MB.get() * 1024 * 1024,
+            max_tickets=envs.SGLANG_ONLINE_MTP_MAX_TICKETS.get(),
+            backward_batch_tokens=envs.SGLANG_ONLINE_MTP_BACKWARD_BATCH_TOKENS.get(),
+            backward_max_group_tickets=(
+                envs.SGLANG_ONLINE_MTP_BACKWARD_MAX_GROUP_TICKETS.get() or None
+            ),
+            accumulation_tokens=envs.SGLANG_ONLINE_MTP_ACCUM_TOKENS.get(),
+            defer_ce=envs.SGLANG_ONLINE_MTP_DEFER_CE.get(),
+            use_triton_lse=envs.SGLANG_ONLINE_MTP_TRITON_LSE.get(),
+            use_triton_expcast=envs.SGLANG_ONLINE_MTP_TRITON_EXPCAST.get(),
+            group_ce_projection=envs.SGLANG_ONLINE_MTP_GROUP_CE.get(),
+            group_ce_steps=envs.SGLANG_ONLINE_MTP_GROUP_CE_STEPS.get(),
+            fuse_ce_argmax=envs.SGLANG_ONLINE_MTP_FUSE_CE_ARGMAX.get(),
+            local_vocab_ce=envs.SGLANG_ONLINE_MTP_LOCAL_VOCAB_CE.get(),
+            defer_grouped_ce_projection=(
+                envs.SGLANG_ONLINE_MTP_DEFER_GROUPED_CE_PROJECTION.get()
+            ),
+            fused_ce_reduction=envs.SGLANG_ONLINE_MTP_FUSED_CE_REDUCTION.get(),
+            async_ce_producer_max_rows=(
+                envs.SGLANG_ONLINE_MTP_ASYNC_CE_PRODUCER_MAX_ROWS.get()
+            ),
+            async_deferred_ce_reduction=(
+                envs.SGLANG_ONLINE_MTP_ASYNC_DEFERRED_CE_REDUCTION.get()
+            ),
+            pipelined_ce_group_tokens=(
+                envs.SGLANG_ONLINE_MTP_PIPELINED_CE_GROUP_TOKENS.get()
+            ),
+            fp8_ce_projection=envs.SGLANG_ONLINE_MTP_FP8_CE_PROJECTION.get(),
+            use_triton_swiglu=envs.SGLANG_ONLINE_MTP_TRITON_SWIGLU.get(),
+            use_triton_ce_rmsnorm=(
+                envs.SGLANG_ONLINE_MTP_TRITON_CE_RMSNORM.get()
+            ),
+            use_triton_optimizer=envs.SGLANG_ONLINE_MTP_TRITON_ADAMW.get(),
+            direct_optimizer_publish=(
+                envs.SGLANG_ONLINE_MTP_DIRECT_ADAMW_PUBLISH.get()
+            ),
+            eager_only=envs.SGLANG_ONLINE_MTP_EAGER_ONLY.get(),
+            cuda_graph_capture=envs.SGLANG_ONLINE_MTP_CUDA_GRAPH_CAPTURE.get(),
+            factorized_gradient_accumulation=(
+                envs.SGLANG_ONLINE_MTP_FACTORIZED_GRAD_ACCUM.get()
+            ),
+            recompute_gate_up=envs.SGLANG_ONLINE_MTP_RECOMPUTE_GATE_UP.get(),
+            apply_updates=envs.SGLANG_ONLINE_MTP_APPLY_UPDATES.get(),
+            async_backward=envs.SGLANG_ONLINE_MTP_ASYNC_BACKWARD.get(),
+            learning_rate=envs.SGLANG_ONLINE_MTP_LEARNING_RATE.get(),
+            weight_decay=envs.SGLANG_ONLINE_MTP_WEIGHT_DECAY.get(),
+        )
+        log_info_on_rank0(
+            logger,
+            "Enabled experimental online native-MTP gradient accumulation: "
+            "backward_batch_tokens="
+            f"{self.online_mtp_runtime.backward_batch_tokens}, "
+            "backward_max_group_tickets="
+            f"{self.online_mtp_runtime.backward_max_group_tickets}, "
+            f"defer_ce={self.online_mtp_runtime.defer_ce}, "
+            f"triton_lse={self.online_mtp_runtime.use_triton_lse}, "
+            f"triton_expcast={self.online_mtp_runtime.use_triton_expcast}, "
+            f"group_ce={self.online_mtp_runtime.group_ce_projection}, "
+            f"group_ce_steps={self.online_mtp_runtime.group_ce_steps}, "
+            f"fuse_ce_argmax={self.online_mtp_runtime.fuse_ce_argmax}, "
+            f"local_vocab_ce={self.online_mtp_runtime.local_vocab_ce}, "
+            "defer_grouped_ce_projection="
+            f"{self.online_mtp_runtime.defer_grouped_ce_projection}, "
+            "fused_ce_reduction="
+            f"{self.online_mtp_runtime.fused_ce_reduction}, "
+            "async_ce_producer_max_rows="
+            f"{self.online_mtp_runtime.async_ce_producer_max_rows}, "
+            "async_deferred_ce_reduction="
+            f"{self.online_mtp_runtime.async_deferred_ce_reduction}, "
+            "pipelined_ce_group_tokens="
+            f"{self.online_mtp_runtime.pipelined_ce_group_tokens}, "
+            "fp8_ce_projection="
+            f"{self.online_mtp_runtime.fp8_ce_projection}, "
+            f"triton_swiglu={self.online_mtp_runtime.use_triton_swiglu}, "
+            "triton_ce_rmsnorm="
+            f"{self.online_mtp_runtime.use_triton_ce_rmsnorm}, "
+            "triton_adamw="
+            f"{self.online_mtp_runtime.use_triton_optimizer}, "
+            "direct_adamw_publish="
+            f"{self.online_mtp_runtime.direct_optimizer_publish}, "
+            f"eager_only={self.online_mtp_runtime.eager_only}, "
+            f"cuda_graph_capture={self.online_mtp_runtime.cuda_graph_capture}, "
+            "factorized_grad_accum="
+            f"{self.online_mtp_runtime.factorized_gradient_accumulation}, "
+            "recompute_gate_up="
+            f"{self.online_mtp_runtime.recompute_gate_up}, "
+            "accumulation_tokens="
+            f"{self.online_mtp_runtime.trainer.accumulator.accumulation_tokens}, "
+            "trainable=dense_mlp+final_norm, "
+            f"async_backward={self.online_mtp_runtime.async_backward}, "
+            f"optimizer_apply={self.online_mtp_runtime.apply_updates}",
+        )
 
     def init_attention_backends(self):
         with (
@@ -514,6 +638,59 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
         )
 
+        online_mtp_tap = None
+        sampling_info = batch.sampling_info
+        online_teacher_is_server_warmup = bool(batch.reqs) and all(
+            isinstance(req.rid, str) and req.rid.startswith(SERVER_WARMUP_RID_PREFIX)
+            for req in batch.reqs
+        )
+        online_teacher_is_user_traffic = all(
+            not (
+                isinstance(req.rid, str) and req.rid.startswith(HEALTH_CHECK_RID_PREFIX)
+            )
+            for req in batch.reqs
+        )
+        online_teacher_is_raw_argmax = (
+            sampling_info.is_all_greedy
+            and not batch.has_grammar
+            and sampling_info.acc_additive_penalties is None
+            and sampling_info.acc_scaling_penalties is None
+            and sampling_info.logit_bias is None
+        )
+        if (
+            self.online_mtp_runtime is not None
+            and not forward_batch.forward_mode.is_idle()
+            and (online_teacher_is_user_traffic or online_teacher_is_server_warmup)
+            and online_teacher_is_raw_argmax
+        ):
+            if self.online_mtp_runtime.eager_only:
+                if not online_teacher_is_server_warmup:
+                    can_cuda_graph = False
+            else:
+                online_mtp_tap = (
+                    self.online_mtp_runtime.maybe_begin_warmup_tap(
+                        expected_ce_steps=self.speculative_num_steps - 1,
+                        expected_ce_rows=(
+                            forward_batch.batch_size
+                            * (self.speculative_num_steps - 1)
+                        ),
+                    )
+                    if online_teacher_is_server_warmup
+                    else self.online_mtp_runtime.begin_tap(
+                        expected_ce_steps=self.speculative_num_steps - 1,
+                        expected_ce_rows=(
+                            forward_batch.batch_size
+                            * (self.speculative_num_steps - 1)
+                        ),
+                    )
+                )
+            if online_mtp_tap is not None:
+                forward_batch.online_mtp_tap = online_mtp_tap
+                # A learning-specific graph variant preserves the fast launch
+                # path. Fall back to eager capture when that experiment is off.
+                if not (can_cuda_graph and self.online_mtp_runtime.cuda_graph_capture):
+                    can_cuda_graph = False
+
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
             c.with_ops_outside_graph(
@@ -528,7 +705,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self.cuda_graph_runner.execute(
+                        forward_batch,
+                        online_mtp_tap=online_mtp_tap,
+                    )
                 )
             else:
                 if (
@@ -591,7 +771,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             position_buf,
         )
 
-        return EagleVerifyInput(
+        verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -607,6 +787,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seq_lens_cpu=None,
             draft_probs=draft_probs,
         )
+        if online_mtp_tap is not None:
+            verify_input.online_mtp_ticket_id = self.online_mtp_runtime.stage(
+                online_mtp_tap
+            )
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -670,6 +855,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
             spec_info.hidden_states = hidden_states
+            online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
+            if online_mtp_tap is not None:
+                online_mtp_tap.begin_step(
+                    i,
+                    input_ids=input_ids,
+                    positions=forward_batch.positions,
+                )
 
             # Run forward under a per-step ForwardContext so the model layer
             # reads attn_backends[i] for the i-th draft step, plus a canary
@@ -699,9 +891,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                if (
+                    online_mtp_tap is not None
+                    and online_mtp_tap.fuse_ce_argmax
+                ):
+                    topk_index = online_mtp_tap.take_ce_argmax(i)[:, None]
+                else:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
                 topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -713,13 +911,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             maybe_detect_oob(
                 topk_index,
                 0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                self.draft_runner.model_config.vocab_size,
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={self.draft_runner.model_config.vocab_size}",
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+        online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
+        if online_mtp_tap is not None:
+            online_mtp_tap.finalize_grouped_ce(self.draft_runner.model.lm_head)
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
@@ -1606,6 +1808,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        online_mtp_ticket_id = verify_input.online_mtp_ticket_id
+        if online_mtp_ticket_id is not None:
+            if not batch.sampling_info.is_all_greedy:
+                raise RuntimeError(
+                    "an online MTP ticket reached non-greedy verification"
+                )
+
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
@@ -1634,6 +1843,63 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens,
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+
+        if online_mtp_ticket_id is not None:
+            online_mtp_teacher_tokens = verify_input.online_mtp_teacher_tokens
+            if online_mtp_teacher_tokens is None:
+                raise RuntimeError(
+                    "greedy verification did not expose target labels for "
+                    "online MTP training"
+                )
+            # Node 0 is the verified root.  Inner draft forward i consumes
+            # node i+1 and predicts the teacher token after that node.  Arrange
+            # labels step-major to match OnlineMTPActivationTap.flatten().
+            online_mtp_labels = (
+                online_mtp_teacher_tokens[:, 1 : self.speculative_num_steps]
+                .transpose(0, 1)
+                .contiguous()
+                .reshape(-1)
+            )
+            loss = self._draft_worker.online_mtp_runtime.verify_and_backward(
+                online_mtp_ticket_id, online_mtp_labels
+            )
+            runtime = self._draft_worker.online_mtp_runtime
+            grad_norm = runtime.maybe_apply_update()
+            if runtime.last_was_warmup:
+                log_info_on_rank0(
+                    logger,
+                    "online MTP startup backward warmup completed and gradients discarded",
+                )
+                runtime.last_was_warmup = False
+            elif runtime.last_backward_launched:
+                completed_losses = runtime.pop_completed_metrics()
+                message = (
+                    "online MTP accumulated "
+                    f"rank={self.tp_rank}, "
+                    f"batches={runtime.backward_batches}, "
+                    f"tickets={runtime.backward_tickets}, "
+                    f"ticket_tokens={runtime.last_ticket_tokens}, "
+                    "max_verified_ticket_tokens="
+                    f"{runtime.max_verified_ticket_tokens}, "
+                    f"ticket_bytes={runtime.last_ticket_bytes}, "
+                    f"tokens={runtime.trainer.accumulator.tokens}, "
+                    f"last_update_tokens={runtime.last_update_tokens}, "
+                    f"completed_losses={completed_losses}, "
+                    f"backpressure_events={runtime.backpressure_events}, "
+                    f"weight_version={runtime.weight_version}, "
+                    f"optimizer_steps={runtime.optimizer_steps}, "
+                    f"last_grad_norm={runtime.last_grad_norm}, "
+                    f"update_prepared_grad_norm={grad_norm}"
+                )
+                if runtime.backward_batches <= 3:
+                    # Initial all-rank diagnostics make TP label/loss divergence
+                    # visible during bring-up.  Steady-state logging is rank 0 only.
+                    logger.info(message)
+                elif runtime.backward_batches % 100 == 0:
+                    log_info_on_rank0(
+                        logger,
+                        message,
+                    )
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),

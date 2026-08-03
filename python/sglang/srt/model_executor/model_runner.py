@@ -576,6 +576,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.hisparse_coordinator = None
 
         self._linear_attn_registry_cache: Any = _UNSET
+        if not self.is_draft_worker:
+            self.use_linear_compact_spec_cache()
 
         # Load model weights and configure
         self.initialize()
@@ -800,7 +802,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._init_lora_cuda_graph_moe_buffers()
 
         # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
+        if server_args.enable_deterministic_inference or get_bool_env_var(
+            "SGLANG_FORCE_BATCH_INVARIANT_OPS"
+        ):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()

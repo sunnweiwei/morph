@@ -684,6 +684,96 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Experimental Qwen3.5/3.6 native-MTP online learning. The first slice
+    # captures every eligible draft batch and accumulates exact manual
+    # gradients for the dense MTP MLP + final norm. Applying cache-safe updates
+    # is a separate opt-in because the default experiment is parity-only.
+    SGLANG_EXPERIMENTAL_ONLINE_MTP = EnvBool(False)
+    SGLANG_ONLINE_MTP_ACTIVATION_MB = EnvInt(1024)
+    SGLANG_ONLINE_MTP_MAX_TICKETS = EnvInt(64)
+    SGLANG_ONLINE_MTP_BACKWARD_BATCH_TOKENS = EnvInt(24)
+    # Optional latency cap for cross-ticket backward grouping. Zero preserves
+    # the activation-ring limit. A finite cap avoids very long tail groups
+    # when a token threshold is deliberately raised to amortize GEMMs and TP
+    # collectives.
+    SGLANG_ONLINE_MTP_BACKWARD_MAX_GROUP_TICKETS = EnvInt(0)
+    SGLANG_ONLINE_MTP_DEFER_CE = EnvBool(False)
+    # Compute the full-vocabulary FP32 logsumexp from BF16 logits in registers,
+    # avoiding a vocabulary-sized FP32 temporary on every learned draft step.
+    SGLANG_ONLINE_MTP_TRITON_LSE = EnvBool(False)
+    SGLANG_ONLINE_MTP_TRITON_EXPCAST = EnvBool(False)
+    # Delay each inner step's probability projection until the end of the D4
+    # draft loop, then issue one larger LM-head GEMM and one TP all-reduce.
+    SGLANG_ONLINE_MTP_GROUP_CE = EnvBool(False)
+    # Execute the three D4 LSE/probability producers as one step-major Triton
+    # grid. Per-row arithmetic and BF16 rounding are unchanged; this only
+    # improves CTA occupancy and removes six tiny graph nodes at low batch.
+    SGLANG_ONLINE_MTP_GROUP_CE_STEPS = EnvBool(False)
+    # Reuse the exact row maximum/index already computed by strict CE LSE for
+    # greedy D4 sampling, deleting a second full-vocabulary argmax scan.
+    SGLANG_ONLINE_MTP_FUSE_CE_ARGMAX = EnvBool(False)
+    # Keep draft LM-head logits vocabulary-sharded. Each rank reduces its BF16
+    # shard to one aligned FP32 statistics packet and uses the H100 multimem
+    # collective for global LSE/greedy selection, avoiding the full-vocabulary
+    # logits all-gather without changing inference tokens.
+    SGLANG_ONLINE_MTP_LOCAL_VOCAB_CE = EnvBool(False)
+    # Retain the already-computed local BF16 probabilities in activation
+    # tickets and delay their LM-head projection to the existing cross-ticket
+    # backward grouping boundary. This can turn several launch-bound tiny
+    # GEMMs into one larger GEMM without changing the CE objective.
+    SGLANG_ONLINE_MTP_DEFER_GROUPED_CE_PROJECTION = EnvBool(False)
+    # Retain the grouped local expected vector in BF16, then combine its
+    # target subtraction and target-logit scalar into one aligned FP32 TP sum
+    # after verification. Disabled by default pending end-to-end benchmarks.
+    SGLANG_ONLINE_MTP_FUSED_CE_REDUCTION = EnvBool(False)
+    # For tickets no larger than this row count, snapshot graph-stable logits
+    # and run the complete strict-BF16 CE producer plus its TP reduction on a
+    # dedicated online-learning stream/communicator. Zero disables the path.
+    SGLANG_ONLINE_MTP_ASYNC_CE_PRODUCER_MAX_ROWS = EnvInt(0)
+    # Pipeline a cross-ticket deferred BF16 probability projection on the
+    # online-training stream. Its TP reduction remains on the standard serving
+    # communicator after the following target verification, avoiding a second
+    # NCCL communicator while overlapping the large frozen LM-head read.
+    SGLANG_ONLINE_MTP_ASYNC_DEFERRED_CE_REDUCTION = EnvBool(False)
+    # Optional larger complete-data group for sub-24-row tickets when the
+    # inter-verify CE pipeline is enabled. Zero keeps the 24-token production
+    # threshold; e.g. 48 halves tiny-ticket backward launch frequency.
+    SGLANG_ONLINE_MTP_PIPELINED_CE_GROUP_TOKENS = EnvInt(0)
+    # Store the grouped local softmax in scaled E4M3 and project it through a
+    # one-time FP8 copy of the frozen LM-head shard on Hopper Tensor Cores.
+    SGLANG_ONLINE_MTP_FP8_CE_PROJECTION = EnvBool(False)
+    # Fuse BF16 SwiGLU's two derivative branches into one in-place Triton
+    # kernel during the manual parameter-only backward.
+    SGLANG_ONLINE_MTP_TRITON_SWIGLU = EnvBool(False)
+    # Fuse the verified hard-CE tail and final Gemma RMSNorm backward into two
+    # kernels with persistent output scratch.
+    SGLANG_ONLINE_MTP_TRITON_CE_RMSNORM = EnvBool(False)
+    # Fuse grad-norm partials and AdamW prepare without parameter-sized FP32
+    # temporaries. The BF16 prepared shadow also reuses the consumed gradient
+    # buffers until graph-stable publication completes.
+    SGLANG_ONLINE_MTP_TRITON_ADAMW = EnvBool(False)
+    # At the synchronized optimizer boundary, let fused AdamW write directly
+    # into the CUDA-graph-stable serving weights. This removes the redundant
+    # BF16 shadow publication pass without changing update arithmetic/order.
+    SGLANG_ONLINE_MTP_DIRECT_ADAMW_PUBLISH = EnvBool(False)
+    # Capture a second draft CUDA-graph variant whose static outputs expose
+    # the activations needed by online backward. Ordinary serving replays keep
+    # using the original graph.
+    SGLANG_ONLINE_MTP_CUDA_GRAPH_CAPTURE = EnvBool(True)
+    # Delay the two full MLP weight-gradient GEMMs until the optimizer
+    # boundary by retaining their exact low-rank outer-product factors.
+    SGLANG_ONLINE_MTP_FACTORIZED_GRAD_ACCUM = EnvBool(False)
+    # Recompute the batch-invariant dense MLP gate/up projection during
+    # backward instead of retaining its BF16 output in every activation ticket.
+    SGLANG_ONLINE_MTP_RECOMPUTE_GATE_UP = EnvBool(False)
+    # Diagnostic ablation: force every eligible batch through eager draft
+    # execution, but do not capture activations or run backward.
+    SGLANG_ONLINE_MTP_EAGER_ONLY = EnvBool(False)
+    SGLANG_ONLINE_MTP_ACCUM_TOKENS = EnvInt(4096)
+    SGLANG_ONLINE_MTP_APPLY_UPDATES = EnvBool(False)
+    SGLANG_ONLINE_MTP_ASYNC_BACKWARD = EnvBool(True)
+    SGLANG_ONLINE_MTP_LEARNING_RATE = EnvFloat(1e-5)
+    SGLANG_ONLINE_MTP_WEIGHT_DECAY = EnvFloat(0.0)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

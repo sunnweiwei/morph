@@ -1,6 +1,7 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/batch_invariant_ops.py
 
 import contextlib
+import os
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any, Dict, Tuple
@@ -35,6 +36,32 @@ _ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
 )
+
+_ALL_BATCH_INVARIANT_OPS = frozenset(
+    {"mm", "log_softmax", "mean", "rms_norm", "bmm"}
+)
+
+
+def _get_enabled_batch_invariant_ops() -> frozenset[str]:
+    """Return the requested deterministic operator families.
+
+    Deterministic inference keeps the historical default (all operators), while
+    speculative-decoding diagnostics can replace only the operator families
+    that have been shown to be batch-shape sensitive. Keeping this selection
+    at registration time means untouched operators use their optimized kernels.
+    """
+    value = os.environ.get("SGLANG_BATCH_INVARIANT_OPS", "all").strip().lower()
+    if value == "all":
+        return _ALL_BATCH_INVARIANT_OPS
+    enabled = frozenset(part.strip() for part in value.split(",") if part.strip())
+    unknown = enabled - _ALL_BATCH_INVARIANT_OPS
+    if unknown:
+        raise ValueError(
+            "Unknown SGLANG_BATCH_INVARIANT_OPS values: "
+            f"{sorted(unknown)}; expected a comma-separated subset of "
+            f"{sorted(_ALL_BATCH_INVARIANT_OPS)} or 'all'."
+        )
+    return enabled
 
 if not _ENABLE_MM_DEEPGEMM:
     print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
@@ -288,6 +315,13 @@ def matmul_persistent(
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        # DeepGEMM's BF16 TMA descriptors require the contiguous K/N
+        # dimensions to be aligned to 16 bytes (8 BF16 elements).  Qwen3.6's
+        # MTP fc1 has N=538; attempting DeepGEMM for that shape fails during
+        # deterministic CUDA-graph warmup instead of falling back to the
+        # batch-invariant Triton kernel below.
+        and N % 8 == 0
+        and K % 8 == 0
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -986,19 +1020,31 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
 
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+    enabled_ops = _get_enabled_batch_invariant_ops()
+    print(f"Batch-invariant operator families: {sorted(enabled_ops)}")
 
     if not _is_npu:
         # Register for detected device
-        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-        _batch_invariant_LIB.impl(
-            "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
-        )
-        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-        _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
-        _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
+        if "mm" in enabled_ops:
+            _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+            _batch_invariant_LIB.impl(
+                "aten::addmm", addmm_batch_invariant, dispatch_key
+            )
+            _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
+        if "log_softmax" in enabled_ops:
+            _batch_invariant_LIB.impl(
+                "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
+            )
+        if "mean" in enabled_ops:
+            _batch_invariant_LIB.impl(
+                "aten::mean.dim", mean_batch_invariant, dispatch_key
+            )
+        if "rms_norm" in enabled_ops:
+            _batch_invariant_LIB.impl(
+                "aten::rms_norm", _rms_norm_aten_compat, dispatch_key
+            )
 
-        if enable_bmm:
+        if enable_bmm and "bmm" in enabled_ops:
             _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
             # Also monkeypatch torch.bmm directly as a fallback
             _original_torch_bmm = torch.bmm

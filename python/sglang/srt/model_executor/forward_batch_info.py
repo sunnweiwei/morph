@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -433,6 +433,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+
+    # Experimental eager native-MTP training activation sink.  This must be a
+    # dataclass field (rather than a dynamic attribute) so EagerRunner's
+    # dataclasses.replace-based static-buffer view preserves it.
+    online_mtp_tap: Optional[Any] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information

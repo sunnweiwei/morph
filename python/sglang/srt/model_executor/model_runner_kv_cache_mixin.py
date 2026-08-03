@@ -101,6 +101,20 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    def use_linear_compact_spec_cache(self: ModelRunner) -> bool:
+        if not self.server_args.enable_linear_compact_spec_cache:
+            return False
+        if self.server_args.speculative_num_draft_tokens is None:
+            raise ValueError(
+                "--enable-linear-compact-spec-cache requires speculative decoding."
+            )
+        if self.kimi_linear_config is None and self.hybrid_gdn_config is None:
+            raise ValueError(
+                "--enable-linear-compact-spec-cache is only supported for "
+                "KDA and GDN hybrid linear-attention models."
+            )
+        return True
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -143,10 +157,19 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
+        global_params = config.mamba2_cache_params
+        mamba_cache_per_req = global_params.mamba_cache_per_req
+
         has_spec_dec = not self.spec_algorithm.is_none()
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+        draft_tokens = server_args.max_speculative_num_draft_tokens
+        intermediate_cache_per_req = (
+            global_params.compact_intermediate_cache_per_req
+            if self.use_linear_compact_spec_cache()
+            else mamba_cache_per_req
+        )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -162,9 +185,7 @@ class ModelRunnerKVCacheMixin:
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    intermediate_cache_per_req * capped_reqs * draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -178,21 +199,21 @@ class ModelRunnerKVCacheMixin:
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    intermediate_cache_per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert mamba_cache_per_req > 0
+            per_req = mamba_cache_per_req
 
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
+            #   2. compact/full intermediate cache:
+            #      (max_mamba_cache_size / ratio) * D * intermediate_cache_per_req
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -202,10 +223,11 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
+                D = draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    mamba_budget_bytes
+                    // (per_req + intermediate_cache_per_req * D / ratio)
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -214,7 +236,7 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = intermediate_cache_per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
@@ -228,7 +250,7 @@ class ModelRunnerKVCacheMixin:
                 f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
                 f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
                 f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
+                f"mamba_cache_per_req={mamba_cache_per_req / (1 << 20):.2f} MB). "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, "
                 f"(3) reduce --speculative-num-draft-tokens, or "
@@ -236,9 +258,7 @@ class ModelRunnerKVCacheMixin:
             )
 
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
-            / (1 << 30)
+            server_args.max_mamba_cache_size * mamba_cache_per_req / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
 
@@ -558,6 +578,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                        enable_linear_compact_spec_cache=self.use_linear_compact_spec_cache(),
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -594,6 +615,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                    enable_linear_compact_spec_cache=self.use_linear_compact_spec_cache(),
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,

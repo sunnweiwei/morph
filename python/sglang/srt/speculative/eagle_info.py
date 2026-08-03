@@ -34,6 +34,14 @@ class EagleVerifyInput(SpecInput):
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
 
+    # Experimental in-engine MTP training.  This is an opaque activation-ring
+    # handle, not a tensor that participates in verify preparation.
+    online_mtp_ticket_id: Optional[int] = None
+    # Greedy verification already computes the full per-node target argmax.
+    # Reuse that tensor as the online-training label source instead of launching
+    # a second vocabulary-wide argmax in the worker after verification.
+    online_mtp_teacher_tokens: Optional[torch.Tensor] = None
+
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
 
