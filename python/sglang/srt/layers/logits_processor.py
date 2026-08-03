@@ -383,6 +383,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
+        local_vocab_only: bool = False,
     ) -> LogitsProcessorOutput:
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
@@ -439,7 +440,12 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                local_vocab_only=local_vocab_only,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -455,6 +461,10 @@ class LogitsProcessor(nn.Module):
             )
 
         # Start to process input logprobs
+        if local_vocab_only:
+            raise ValueError(
+                "local-vocabulary logits cannot service input-logprob requests"
+            )
         # Determine whether to use chunked or non-chunked logits processing.
         # Skip chunking if:
         # 1. Chunking is disabled
@@ -907,6 +917,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        local_vocab_only: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -923,7 +934,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
+        if self.do_tensor_parallel_all_gather and not local_vocab_only:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
@@ -933,7 +944,24 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
-        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        if local_vocab_only:
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                raise ValueError(
+                    "local-vocabulary logits do not support DP-attention scattering"
+                )
+            indices = lm_head.shard_indices
+            if indices.num_added_elements or indices.num_added_vocab_padding:
+                raise ValueError(
+                    "local-vocabulary logits currently require an ordinary base vocabulary"
+                )
+            local_vocab = indices.org_vocab_end_index - indices.org_vocab_start_index
+            logits = logits[:, :local_vocab]
+            if self.final_logit_softcapping:
+                raise ValueError(
+                    "local-vocabulary logits do not yet support logit softcapping"
+                )
+        else:
+            logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
             if not _is_npu:

@@ -24,6 +24,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -115,6 +116,37 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        self._online_mtp_stats_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=self.tp_size > 1,
+            # Every draft step contains intervening TP collectives in the MTP
+            # transformer, satisfying the same contract as the logits gatherer.
+            skip_entry_sync=True,
+        )
+
+    def prepare_online_local_vocab_ce(self) -> None:
+        """Build the tiny symmetric statistics collective before graph capture."""
+
+        indices = self.lm_head.shard_indices
+        local_vocab = indices.org_vocab_end_index - indices.org_vocab_start_index
+        if (
+            indices.num_added_elements
+            or indices.num_added_vocab_padding
+            or local_vocab != self.lm_head.weight.shape[0]
+        ):
+            raise ValueError(
+                "online local-vocabulary CE requires equal contiguous base-vocab shards"
+            )
+        if self.logits_processor.final_logit_softcapping:
+            raise ValueError(
+                "online local-vocabulary CE does not support logit softcapping"
+            )
+        packet = torch.zeros(
+            (1, 4), dtype=torch.float32, device=self.lm_head.weight.device
+        )
+        self._online_mtp_stats_gatherer(packet.view(torch.bfloat16))
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -154,6 +186,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         **kwargs,
     ):
         exit_stack = ExitStack()
+        online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
         if (
             is_npu()
             and self.quant_config is None
@@ -186,12 +219,22 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
+            if online_mtp_tap is not None:
+                online_mtp_tap.record("input_embedding", input_embeds)
+                online_mtp_tap.record("target_hidden", hidden_states)
+
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
+            if online_mtp_tap is not None:
+                online_mtp_tap.record("fc_input", hidden_states)
+
             hidden_states = self.fc(hidden_states)
+
+            if online_mtp_tap is not None:
+                online_mtp_tap.record("fc_output", hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(
@@ -203,9 +246,135 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         finally:
             exit_stack.close()
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+        local_vocab_ce = bool(
+            online_mtp_tap is not None and online_mtp_tap.local_vocab_ce
         )
+        output = self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            local_vocab_only=local_vocab_ce,
+        )
+        if online_mtp_tap is not None:
+            if online_mtp_tap.async_ce_producer or online_mtp_tap.defer_ce:
+                # Preserve inference logits until labels arrive, then process
+                # them on the dedicated online-learning stream. The async path
+                # starts its label-independent producer immediately after the
+                # graph-stable snapshot, overlapping target verification.
+                online_mtp_tap.record("ce_logits", output.next_token_logits)
+            else:
+                if online_mtp_tap.group_ce_projection:
+                    from sglang.srt.speculative.online_mtp_training import (
+                        vocab_parallel_ce_forward_probability,
+                    )
+
+                    indices = self.lm_head.shard_indices
+                    fp8_ce_projection = online_mtp_tap.fp8_ce_weight is not None
+                    probability_dtype = (
+                        torch.float8_e4m3fn
+                        if fp8_ce_projection
+                        else self.lm_head.weight.dtype
+                    )
+                    probability_out = online_mtp_tap.reserve_ce_probability(
+                        output.next_token_logits.shape[0],
+                        (indices.org_vocab_end_index - indices.org_vocab_start_index),
+                        dtype=probability_dtype,
+                        device=output.next_token_logits.device,
+                    )
+                    if local_vocab_ce:
+                        from sglang.srt.speculative.triton_ops.online_mtp_lse import (
+                            compact_global_vocab_stats,
+                            compact_local_vocab_stats,
+                            compact_vocab_probability,
+                        )
+
+                        local_logits = output.next_token_logits
+                        if local_logits.dtype != self.lm_head.weight.dtype:
+                            raise RuntimeError(
+                                "local-vocabulary CE logits lost their inference dtype"
+                            )
+                        packed_stats = compact_local_vocab_stats(
+                            local_logits,
+                            global_vocab_start=indices.org_vocab_start_index,
+                        )
+                        gathered_stats = self._online_mtp_stats_gatherer(
+                            packed_stats.view(torch.bfloat16)
+                        ).view(torch.float32)
+                        logsumexp, greedy_index = compact_global_vocab_stats(
+                            gathered_stats, tp_size=self.tp_size
+                        )
+                        probability = compact_vocab_probability(
+                            local_logits,
+                            logsumexp,
+                            local_start=0,
+                            local_stop=local_logits.shape[1],
+                            output_dtype=probability_dtype,
+                            out=probability_out,
+                            store_scale=(448.0 if fp8_ce_projection else 1.0),
+                        )
+                        online_mtp_tap.record("ce_logsumexp", logsumexp)
+                        online_mtp_tap.record_ce_probability(probability)
+                        online_mtp_tap.record_ce_argmax(greedy_index)
+                    elif online_mtp_tap.group_ce_steps:
+                        # Keep the three graph-local logits alive only until
+                        # the D4 loop finishes. The grouped producer then
+                        # launches one LSE pair and one probability kernel for
+                        # all steps, writing directly into ``probability_out``.
+                        online_mtp_tap.record_grouped_ce_logits(
+                            output.next_token_logits
+                        )
+                    elif online_mtp_tap.fuse_ce_argmax:
+                        from sglang.srt.speculative.triton_ops.online_mtp_lse import (
+                            compact_vocab_logsumexp_argmax,
+                            compact_vocab_probability,
+                        )
+
+                        logsumexp, greedy_index = compact_vocab_logsumexp_argmax(
+                            output.next_token_logits
+                        )
+                        probability = compact_vocab_probability(
+                            output.next_token_logits,
+                            logsumexp,
+                            local_start=indices.org_vocab_start_index,
+                            local_stop=indices.org_vocab_end_index,
+                            output_dtype=probability_dtype,
+                            out=probability_out,
+                            store_scale=(448.0 if fp8_ce_projection else 1.0),
+                        )
+                        online_mtp_tap.record("ce_logsumexp", logsumexp)
+                        online_mtp_tap.record_ce_probability(probability)
+                        online_mtp_tap.record_ce_argmax(greedy_index)
+                    else:
+                        logsumexp, probability = (
+                            vocab_parallel_ce_forward_probability(
+                                output.next_token_logits,
+                                self.lm_head,
+                                use_triton_lse=online_mtp_tap.use_triton_lse,
+                                use_triton_expcast=online_mtp_tap.use_triton_expcast,
+                                out=probability_out,
+                                output_dtype=probability_dtype,
+                                probability_store_scale=(
+                                    448.0 if fp8_ce_projection else 1.0
+                                ),
+                            )
+                        )
+                        online_mtp_tap.record("ce_logsumexp", logsumexp)
+                        online_mtp_tap.record_ce_probability(probability)
+                else:
+                    from sglang.srt.speculative.online_mtp_training import (
+                        vocab_parallel_ce_forward_stats,
+                    )
+
+                    logsumexp, expected_weight = vocab_parallel_ce_forward_stats(
+                        output.next_token_logits,
+                        self.lm_head,
+                        use_triton_lse=online_mtp_tap.use_triton_lse,
+                        use_triton_expcast=online_mtp_tap.use_triton_expcast,
+                    )
+                    online_mtp_tap.record("ce_logsumexp", logsumexp)
+                    online_mtp_tap.record("ce_expected_weight", expected_weight)
+        return output
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

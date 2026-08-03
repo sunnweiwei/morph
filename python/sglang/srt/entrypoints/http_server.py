@@ -59,7 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX, SERVER_WARMUP_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -2075,6 +2075,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
+
+    # Mark the built-in generation warmup so optional online-learning paths do
+    # not treat synthetic startup traffic as user training data.
+    if model_info["is_generation"]:
+        json_data["rid"] = f"{SERVER_WARMUP_RID_PREFIX}_{uuid.uuid4().hex}"
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:

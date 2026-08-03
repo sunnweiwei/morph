@@ -259,6 +259,34 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
+        self.online_mtp_capture_taps = {}
+        self.online_mtp_ce_probability_buffer = None
+        online_runtime = getattr(self.eagle_worker, "online_mtp_runtime", None)
+        if (
+            online_runtime is not None
+            and online_runtime.cuda_graph_capture
+            and not online_runtime.eager_only
+            and online_runtime.group_ce_projection
+        ):
+            lm_head = online_runtime.trainer.lm_head
+            indices = lm_head.shard_indices
+            local_vocab = (
+                indices.org_vocab_end_index - indices.org_vocab_start_index
+            )
+            inner_steps = self.eagle_worker.speculative_num_steps - 1
+            # Online graph replays are serialized on the serving stream and
+            # consume probabilities in-graph before returning.  One fixed
+            # max-shape owner is therefore safe to share across every captured
+            # batch shape, instead of pinning one large owner per graph tap.
+            self.online_mtp_ce_probability_buffer = torch.empty(
+                (inner_steps * self.max_num_token, local_vocab),
+                dtype=(
+                    torch.float8_e4m3fn
+                    if online_runtime.fp8_ce_projection
+                    else lm_head.weight.dtype
+                ),
+                device=lm_head.weight.device,
+            )
 
         self.backend = resolve_decode_backend(self)
 
@@ -282,7 +310,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         # EAGLE doesn't use stream_idx / lora variants.
-        return ShapeKey(size=bs)
+        return ShapeKey(size=bs, variant_label=variant_label)
 
     # -----------------------------------------------------------------
     # can_run_graph
@@ -474,6 +502,74 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 post_warmup_hook=post_warmup_hook,
             )
 
+            online_runtime = getattr(self.eagle_worker, "online_mtp_runtime", None)
+            if (
+                online_runtime is not None
+                and online_runtime.cuda_graph_capture
+                and not online_runtime.eager_only
+            ):
+                if online_runtime.defer_ce:
+                    raise ValueError(
+                        "online MTP CUDA-graph capture currently requires "
+                        "SGLANG_ONLINE_MTP_DEFER_CE=0"
+                    )
+                from sglang.srt.speculative.online_mtp_training import (
+                    OnlineMTPActivationTap,
+                )
+
+                graph_tap = OnlineMTPActivationTap(
+                    weight_version=online_runtime.weight_version,
+                    # References are enough during graph capture. They keep the
+                    # graph allocations live; replay snapshots them asynchronously.
+                    clone_tensors=False,
+                    recompute_gate_up=online_runtime.recompute_gate_up,
+                    use_triton_lse=online_runtime.use_triton_lse,
+                    use_triton_expcast=online_runtime.use_triton_expcast,
+                    group_ce_projection=online_runtime.group_ce_projection,
+                    group_ce_steps=online_runtime.group_ce_steps,
+                    fuse_ce_argmax=online_runtime.fuse_ce_argmax,
+                    local_vocab_ce=online_runtime.local_vocab_ce,
+                    defer_grouped_ce_projection=(
+                        online_runtime.defer_grouped_ce_projection
+                    ),
+                    defer_grouped_ce_projection_min_rows=(
+                        online_runtime.backward_batch_tokens
+                        + int(online_runtime.async_deferred_ce_reduction)
+                    ),
+                    defer_grouped_ce_projection_include_base=(
+                        online_runtime.async_deferred_ce_reduction
+                    ),
+                    fused_ce_reduction=online_runtime.fused_ce_reduction,
+                    async_ce_producer=online_runtime.use_async_ce_producer(
+                        num_seqs * (self.eagle_worker.speculative_num_steps - 1)
+                    ),
+                    fp8_ce_weight=online_runtime.fp8_ce_weight,
+                    fp8_ce_weight_scale=online_runtime.fp8_ce_weight_scale,
+                    fp8_ce_probability_scale=(
+                        online_runtime.fp8_ce_probability_scale
+                    ),
+                    expected_ce_steps=self.eagle_worker.speculative_num_steps - 1,
+                    ce_probability_buffer=self.online_mtp_ce_probability_buffer,
+                )
+                forward_batch.online_mtp_tap = graph_tap
+
+                def run_online_once():
+                    graph_tap.reset()
+                    return run_once()
+
+                online_shape_key = self._make_graph_key(
+                    num_seqs, variant_label="online_mtp"
+                )
+                self.backend.capture_one(
+                    online_shape_key,
+                    run_online_once,
+                    dummies=None,
+                    post_warmup_hook=post_warmup_hook,
+                )
+                graph_tap.validate_mlp_complete()
+                self.online_mtp_capture_taps[online_shape_key] = graph_tap
+                forward_batch.online_mtp_tap = None
+
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (
             t[:raw_bs] if t is not None else None for t in out
@@ -483,7 +579,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def execute(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch, online_mtp_tap=None):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -636,7 +732,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.bs = bs
 
         # Replay via backend
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs,
+            variant_label="online_mtp" if online_mtp_tap is not None else None,
+        )
         timer_ctx = (
             self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
             if self.model_runner.device_timer
@@ -644,6 +743,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        if online_mtp_tap is not None:
+            template = self.online_mtp_capture_taps.get(shape_key)
+            if template is None:
+                raise RuntimeError(
+                    f"online MTP CUDA graph was not captured for shape {shape_key}"
+                )
+            self.eagle_worker.online_mtp_runtime.snapshot_cuda_graph_tap(
+                online_mtp_tap,
+                template,
+                num_rows=raw_bs,
+            )
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

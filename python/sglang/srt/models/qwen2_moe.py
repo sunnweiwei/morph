@@ -213,13 +213,17 @@ class Qwen2MoeMLP(nn.Module):
         x,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
+        online_mtp_tap=None,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        activated = self.act_fn(gate_up)
+        if online_mtp_tap is not None:
+            online_mtp_tap.record("mlp_input", x)
+            online_mtp_tap.record("mlp_gate_up", gate_up)
+        output, _ = self.down_proj(
+            activated, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
-        return x
+        return output
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):

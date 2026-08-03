@@ -74,6 +74,7 @@ def _gdn_ba_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     )
     return out
 
+
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -741,6 +742,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ),
             )
         )
+        online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(
@@ -771,7 +773,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                online_mtp_tap=online_mtp_tap,
             )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1126,6 +1131,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
@@ -1156,7 +1162,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                online_mtp_tap=online_mtp_tap,
             )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -1402,10 +1411,18 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
+            online_mtp_tap = getattr(forward_batch, "online_mtp_tap", None)
             if residual is None:
+                final_norm_input = hidden_states
                 hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states, final_norm_input = self.norm(hidden_states, residual)
+            if online_mtp_tap is not None:
+                # The fused residual-add RMSNorm already materializes the
+                # combined norm input. Saving that single tensor replaces the
+                # earlier hidden+residual pair; the normalized output can be
+                # reconstructed from it for loss reporting.
+                online_mtp_tap.record("final_norm_input", final_norm_input)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
